@@ -1,0 +1,111 @@
+# Prompt user for the API Key and run-as user
+$apiKey = Read-Host "Enter your API Key"
+$runAsUser = Read-Host "Enter the run-as user (e.g., lseg\ichohan-a)"
+
+# Prompt user for the API User Name which will be used to make BeyondTrust API Calls
+$Credential = Get-Credential -Message "Enter your password (leave blank if not required):" -UserName $runAsUser
+
+# Set the base URL for BeyondTrust
+$BThost = "paa.prod.stockex.local"
+$baseUrl = "https://${BThost}/BeyondTrust/api/public/v3/"
+
+# Enforcing TLS1.2 Protocol for secure communication
+[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+
+# Forming the Authorization header
+if ($Credential.Password.Length -gt 0) {
+    $passwordDecrypted = $Credential.GetNetworkCredential().Password
+    $headers = @{ Authorization = "PS-Auth key=${apiKey};runas=${runAsUser};pwd=[${passwordDecrypted}]" }
+} else {
+    $headers = @{ Authorization = "PS-Auth key=${apiKey};runas=${runAsUser}" }
+}
+
+# Display system and user information
+Write-Host "System: $env:COMPUTERNAME"
+Write-Host "User: $env:USERNAME"
+
+# Sign In Block
+try {
+    Write-Host "Signing-in.."
+    $signinResult = Invoke-RestMethod -Uri "${baseUrl}Auth/SignAppIn" -Method Post -Headers $headers -SessionVariable session
+    Write-Host "..Signed-In as $($signinResult.UserName)"
+}
+catch {
+    $StatusCode = $_.Exception.Response.StatusCode.value__
+    Write-Host $StatusCode
+
+    if ($StatusCode -eq 401 -and ($_.Exception.Response.Headers.Contains("WWW-Authenticate-2FA") -eq $true)) {
+        Write-Host "MFA Required.."
+        $mfacode = Read-Host "Enter your MFA Challenge Code:"
+        $headers = @{ Authorization = "PS-Auth key=${apiKey};runas=${runAsUser};challenge=${mfacode}" }
+        if ($passwordDecrypted) {
+            $headers.Authorization += ";pwd=[${passwordDecrypted}]"
+        }
+        try {
+            $mfaSignin = Invoke-RestMethod -Uri "${baseUrl}Auth/SignAppIn" -Method Post -ContentType "application/json" -Headers $headers -WebSession $session
+            Write-Host "..Signed-In to BeyondTrust as $($mfaSignin.UserName)"
+        }
+        catch {
+            Write-Host $_.Exception.Message
+            throw
+        }
+    }
+    elseif ($StatusCode -eq 403) {
+        Write-Host $_.Exception.Message
+        Write-Host "There was an issue logging into BeyondTrust. Please check User Audits for more information"
+        throw
+    }
+    else {
+        Write-Host $_.Exception.Message
+        throw
+    }
+}
+
+# Define the output file path
+$outputFilePath = "C:\Users\ichohan\logs\output.txt"
+
+# Check if the output file exists and delete it
+if (Test-Path $outputFilePath) {
+    Remove-Item $outputFilePath
+    Write-Host "Existing output file deleted."
+}
+
+# Step 1: Get access policies
+try {
+    $accessPolicies = Invoke-RestMethod -Uri "${baseUrl}AccessPolicies" -Method Get -Headers $headers -WebSession $session
+    Write-Host "Retrieved access policies."
+}
+catch {
+    Write-Host "Failed to retrieve access policies: $($_.Exception.Message)"
+    throw
+}
+
+# Create a list to store the results
+$results = @()
+
+# Step 2: Get user groups for each policy
+foreach ($policy in $accessPolicies) {
+    Write-Host "Processing policy: $($policy.Name)"
+    $userGroupIds = $policy.UserGroupIds  # Assuming UserGroupIds is a list of IDs
+    $adGroups = @()
+    foreach ($userGroupId in $userGroupIds) {
+        try {
+            $userGroup = Invoke-RestMethod -Uri "${baseUrl}UserGroups/$userGroupId" -Method Get -Headers $headers -WebSession $session
+            # Step 3: Check if user group is an AD group
+            if ($userGroup.Name -like "*AD*") {  # Example condition
+                $adGroups += $userGroup.Name
+            }
+        }
+        catch {
+            Write-Host "Failed to retrieve user group $($userGroupId): $($_.Exception.Message)"
+        }
+    }
+    if ($adGroups.Count -gt 0) {
+        $results += "$($policy.Name), $($adGroups -join ', ')"
+    }
+}
+
+# Output the results to a text file
+$results -join "`n" | Out-File -FilePath $outputFilePath
+
+Write-Host "Results have been written to $outputFilePath"
